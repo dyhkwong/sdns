@@ -5,13 +5,15 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/semihalev/sdns/middleware/resolver/dnssec"
+	"github.com/semihalev/sdns/util"
 	"github.com/stretchr/testify/assert"
 )
 
-func TestValidationError(t *testing.T) {
+func TestEDEError(t *testing.T) {
 	// Test Error() with wrapped error
 	wrapped := errors.New("wrapped error")
-	err := &ValidationError{
+	err := &util.EDEError{
 		Code:    dns.ExtendedErrorCodeNetworkError,
 		Message: "network failed",
 		Err:     wrapped,
@@ -20,7 +22,7 @@ func TestValidationError(t *testing.T) {
 	assert.Contains(t, err.Error(), "wrapped error")
 
 	// Test Error() without wrapped error
-	errNoWrap := &ValidationError{
+	errNoWrap := &util.EDEError{
 		Code:    dns.ExtendedErrorCodeDNSBogus,
 		Message: "bogus response",
 	}
@@ -60,8 +62,8 @@ func TestNoReachableAuthAtZone(t *testing.T) {
 	assert.Contains(t, err.Message, "delegation")
 }
 
-func TestValidationErrorWithContext(t *testing.T) {
-	original := &ValidationError{
+func TestEDEErrorWithContext(t *testing.T) {
+	original := &util.EDEError{
 		Code:    dns.ExtendedErrorCodeDNSBogus,
 		Message: "validation failed",
 	}
@@ -74,7 +76,7 @@ func TestValidationErrorWithContext(t *testing.T) {
 }
 
 func TestDNSKEYMissingForZone(t *testing.T) {
-	err := DNSKEYMissingForZone("secure.example.com.")
+	err := dnssec.DNSKEYMissingForZone("secure.example.com.")
 
 	assert.Equal(t, dns.ExtendedErrorCodeDNSKEYMissing, err.Code)
 	assert.Contains(t, err.Message, "secure.example.com.")
@@ -82,7 +84,7 @@ func TestDNSKEYMissingForZone(t *testing.T) {
 }
 
 func TestSignatureExpiredForRRset(t *testing.T) {
-	err := SignatureExpiredForRRset("A", "example.com.")
+	err := dnssec.SignatureExpiredForRRset("A", "example.com.")
 
 	assert.Equal(t, dns.ExtendedErrorCodeSignatureExpired, err.Code)
 	assert.Contains(t, err.Message, "A")
@@ -90,18 +92,18 @@ func TestSignatureExpiredForRRset(t *testing.T) {
 	assert.Contains(t, err.Message, "expired")
 }
 
-func TestPredefinedValidationErrors(t *testing.T) {
+func TestPredefinedEDEErrors(t *testing.T) {
 	// Test that predefined errors have correct codes
 	tests := []struct {
 		name string
-		err  *ValidationError
+		err  *util.EDEError
 		code uint16
 	}{
-		{"errNoDNSKEY", errNoDNSKEY, dns.ExtendedErrorCodeDNSKEYMissing},
-		{"errMissingKSK", errMissingKSK, dns.ExtendedErrorCodeDNSKEYMissing},
-		{"errNoSignatures", errNoSignatures, dns.ExtendedErrorCodeRRSIGsMissing},
-		{"errInvalidSignaturePeriod", errInvalidSignaturePeriod, dns.ExtendedErrorCodeSignatureExpired},
-		{"errNSECMissingCoverage", errNSECMissingCoverage, dns.ExtendedErrorCodeNSECMissing},
+		{"dnssec.ErrNoDNSKEY", dnssec.ErrNoDNSKEY, dns.ExtendedErrorCodeDNSKEYMissing},
+		{"dnssec.ErrMissingKSK", dnssec.ErrMissingKSK, dns.ExtendedErrorCodeDNSKEYMissing},
+		{"dnssec.ErrNoSignatures", dnssec.ErrNoSignatures, dns.ExtendedErrorCodeRRSIGsMissing},
+		{"dnssec.ErrInvalidSignaturePeriod", dnssec.ErrInvalidSignaturePeriod, dns.ExtendedErrorCodeSignatureExpired},
+		{"dnssec.ErrNSECMissingCoverage", dnssec.ErrNSECMissingCoverage, dns.ExtendedErrorCodeNSECMissing},
 		{"errNoReachableAuth", errNoReachableAuth, dns.ExtendedErrorCodeNoReachableAuthority},
 		{"errMaxDepth", errMaxDepth, dns.ExtendedErrorCodeOther},
 	}

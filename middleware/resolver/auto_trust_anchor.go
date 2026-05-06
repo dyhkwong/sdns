@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/semihalev/sdns/middleware/resolver/dnssec"
 	"github.com/semihalev/sdns/util"
 	"github.com/semihalev/zlog/v2"
 )
@@ -578,11 +579,11 @@ func sameKeyExceptRevoke(currentKey, revokedKey *dns.DNSKEY) bool {
 // fetched in, produced by revokedKey itself. Per RFC 5011 §2.1 this
 // self-signature is a precondition for accepting a revocation.
 func revocationIsSelfSigned(rrs []dns.RR, revokedKey *dns.DNSKEY) bool {
-	dnskeys := extractRRSet(rrs, "", dns.TypeDNSKEY)
+	dnskeys := util.ExtractRRSet(rrs, "", dns.TypeDNSKEY)
 	if len(dnskeys) == 0 {
 		return false
 	}
-	rrsigs := extractRRSet(rrs, "", dns.TypeRRSIG)
+	rrsigs := util.ExtractRRSet(rrs, "", dns.TypeRRSIG)
 	revokedTag := revokedKey.KeyTag()
 	for _, rr := range rrsigs {
 		rrsig := rr.(*dns.RRSIG)
@@ -623,9 +624,9 @@ func revocationIsSelfSigned(rrs []dns.RR, revokedKey *dns.DNSKEY) bool {
 // drive any other state transition (AddPend seeding, Missing
 // marking, etc.) from it.
 func verifyFetchedKeys(rootKeys []dns.RR, rrs []dns.RR) (ok bool, revocationOnly bool, err error) {
-	fetchedkeys := extractRRSet(rrs, "", dns.TypeDNSKEY)
+	fetchedkeys := util.ExtractRRSet(rrs, "", dns.TypeDNSKEY)
 	if len(fetchedkeys) == 0 {
-		return false, false, errNoDNSKEY
+		return false, false, dnssec.ErrNoDNSKEY
 	}
 
 	currentKeys := make(map[uint16]*dns.DNSKEY)
@@ -637,7 +638,7 @@ func verifyFetchedKeys(rootKeys []dns.RR, rrs []dns.RR) (ok bool, revocationOnly
 	}
 
 	if len(currentKeys) == 0 {
-		return false, false, errMissingKSK
+		return false, false, dnssec.ErrMissingKSK
 	}
 
 	// Revoked DNSKEYs whose *key material* matches a current trust
@@ -659,12 +660,12 @@ func verifyFetchedKeys(rootKeys []dns.RR, rrs []dns.RR) (ok bool, revocationOnly
 		}
 	}
 
-	rrsigs := extractRRSet(rrs, "", dns.TypeRRSIG)
+	rrsigs := util.ExtractRRSet(rrs, "", dns.TypeRRSIG)
 	if len(rrsigs) == 0 {
-		return false, false, errNoSignatures
+		return false, false, dnssec.ErrNoSignatures
 	}
 
-	var lastErr error = errMissingDNSKEY
+	var lastErr error = dnssec.ErrMissingDNSKEY
 
 	// Pass 1: non-revoked current trust anchors. A success here is
 	// full authentication — the caller may process any state
@@ -702,12 +703,12 @@ func verifyFetchedKeys(rootKeys []dns.RR, rrs []dns.RR) (ok bool, revocationOnly
 // otherwise updates *lastErr with the most informative failure.
 func verifyOneRRSIG(rrsig *dns.RRSIG, k *dns.DNSKEY, fetchedkeys []dns.RR, lastErr *error) bool {
 	if rrsig.SignerName != k.Header().Name {
-		*lastErr = errMissingSigned
+		*lastErr = dnssec.ErrMissingSigned
 		return false
 	}
-	rest := extractRRSet(fetchedkeys, rrsig.Header().Name, rrsig.TypeCovered)
+	rest := util.ExtractRRSet(fetchedkeys, rrsig.Header().Name, rrsig.TypeCovered)
 	if len(rest) == 0 {
-		*lastErr = errMissingSigned
+		*lastErr = dnssec.ErrMissingSigned
 		return false
 	}
 	if err := rrsig.Verify(k, rest); err != nil {
@@ -715,7 +716,7 @@ func verifyOneRRSIG(rrsig *dns.RRSIG, k *dns.DNSKEY, fetchedkeys []dns.RR, lastE
 		return false
 	}
 	if !rrsig.ValidityPeriod(time.Time{}) {
-		*lastErr = errInvalidSignaturePeriod
+		*lastErr = dnssec.ErrInvalidSignaturePeriod
 		return false
 	}
 	return true

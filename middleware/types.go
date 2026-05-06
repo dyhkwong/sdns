@@ -46,7 +46,7 @@ func isNilHandler(h Handler) bool {
 	}
 	v := reflect.ValueOf(h)
 	switch v.Kind() {
-	case reflect.Ptr, reflect.Interface, reflect.Chan, reflect.Map, reflect.Slice, reflect.Func:
+	case reflect.Pointer, reflect.Interface, reflect.Chan, reflect.Map, reflect.Slice, reflect.Func:
 		return v.IsNil()
 	}
 	return false

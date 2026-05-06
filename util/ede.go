@@ -3,9 +3,43 @@ package util
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"github.com/miekg/dns"
 )
+
+// EDEError is an error that carries an Extended DNS Error code (RFC
+// 8914). Network and DNSSEC validation paths return EDEError values so
+// that the response builder can copy the code straight into the EDE
+// option without re-classifying string messages.
+type EDEError struct {
+	Code    uint16
+	Message string
+	Err     error
+}
+
+func (e *EDEError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %v", e.Message, e.Err)
+	}
+	return e.Message
+}
+
+func (e *EDEError) Unwrap() error { return e.Err }
+
+// EDECode returns the Extended DNS Error code for this error.
+func (e *EDEError) EDECode() uint16 { return e.Code }
+
+// WithContext returns a new EDEError whose Message is e.Message followed
+// by the formatted context. Useful for tagging a generic sentinel with
+// the zone or qname that triggered it without losing the code.
+func (e *EDEError) WithContext(format string, args ...any) *EDEError {
+	return &EDEError{
+		Code:    e.Code,
+		Message: fmt.Sprintf(e.Message+" - "+format, args...),
+		Err:     e.Err,
+	}
+}
 
 // SetEDE adds an Extended DNS Error to the response.
 func SetEDE(msg *dns.Msg, code uint16, extraText string) {

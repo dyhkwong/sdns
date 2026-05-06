@@ -9,6 +9,7 @@ import (
 
 	"github.com/miekg/dns"
 	"github.com/semihalev/sdns/authority"
+	"github.com/semihalev/sdns/middleware/resolver/dnssec"
 	"github.com/semihalev/sdns/util"
 	"github.com/stretchr/testify/assert"
 )
@@ -126,7 +127,7 @@ func Test_resolverNoSigDNSSEC(t *testing.T) {
 	// Expected behavior: signed zone missing required signatures should be treated
 	// as bogus and fail closed.
 	assert.Error(t, err)
-	assert.True(t, errors.Is(err, errNoSignatures), "expected errNoSignatures, got %v", err)
+	assert.True(t, errors.Is(err, dnssec.ErrNoSignatures), "expected dnssec.ErrNoSignatures, got %v", err)
 	assert.Nil(t, resp)
 }
 

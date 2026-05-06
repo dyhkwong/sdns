@@ -279,7 +279,7 @@ func Test_isZoneSecureIntegration(t *testing.T) {
 	}{
 		{
 			// Signed zone that omits RRSIGs — exercises answer() → isZoneSecure()
-			// returning true → errNoSignatures.
+			// returning true → dnssec.ErrNoSignatures.
 			name:      "signed zone missing RRSIG returns error",
 			qname:     "nosig-e5ecc382.test-alg15.dnscheck.tools.",
 			expectErr: true,
@@ -288,7 +288,7 @@ func Test_isZoneSecureIntegration(t *testing.T) {
 		{
 			// Insecure delegation: parent (com.) is signed but
 			// stackoverflow.com. has no DS record at the delegation point.
-			// Unsigned responses must not trigger errNoSignatures.
+			// Unsigned responses must not trigger dnssec.ErrNoSignatures.
 			name:      "insecure delegation resolves successfully",
 			qname:     "stackoverflow.com.",
 			expectErr: false,
@@ -297,7 +297,7 @@ func Test_isZoneSecureIntegration(t *testing.T) {
 		{
 			// Nonexistent name under a signed zone — exercises authority() →
 			// isZoneSecure() path. The resolver should validate the NSEC/RRSIG
-			// proofs and not return errNoSignatures.
+			// proofs and not return dnssec.ErrNoSignatures.
 			name:      "NXDOMAIN under signed zone validates",
 			qname:     "thisdoesnotexist.ietf.org.",
 			expectErr: false,

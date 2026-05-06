@@ -6,6 +6,8 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/semihalev/sdns/middleware/resolver/dnssec"
+	"github.com/semihalev/sdns/util"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -68,7 +70,7 @@ func Test_extractRRSet(t *testing.T) {
 		rr = append(rr, a)
 	}
 
-	rre := extractRRSet(rr, "test.com.", dns.TypeA)
+	rre := util.ExtractRRSet(rr, "test.com.", dns.TypeA)
 	assert.Len(t, rre, 3)
 }
 
@@ -80,15 +82,15 @@ func Test_extractRRSetMultipleTypes(t *testing.T) {
 	rr = append(rr, a, aaaa, mx)
 
 	// Test with multiple types
-	rre := extractRRSet(rr, "test.com.", dns.TypeA, dns.TypeAAAA)
+	rre := util.ExtractRRSet(rr, "test.com.", dns.TypeA, dns.TypeAAAA)
 	assert.Len(t, rre, 2)
 
 	// Test with empty input
-	rre = extractRRSet(nil, "", dns.TypeA)
+	rre = util.ExtractRRSet(nil, "", dns.TypeA)
 	assert.Nil(t, rre)
 
 	// Test with name filter mismatch
-	rre = extractRRSet(rr, "other.com.", dns.TypeA)
+	rre = util.ExtractRRSet(rr, "other.com.", dns.TypeA)
 	assert.Len(t, rre, 0)
 }
 
@@ -108,12 +110,12 @@ func Test_verifyNSEC(t *testing.T) {
 	}
 
 	// Should find A type
-	typeMatch := verifyNSEC(q, []dns.RR{nsec})
+	typeMatch := dnssec.VerifyNSEC(q, []dns.RR{nsec})
 	assert.True(t, typeMatch)
 
 	// Query for type not in bitmap
 	q2 := dns.Question{Name: "example.com.", Qtype: dns.TypeMX}
-	typeMatch = verifyNSEC(q2, []dns.RR{nsec})
+	typeMatch = dnssec.VerifyNSEC(q2, []dns.RR{nsec})
 	assert.False(t, typeMatch)
 }
 
@@ -122,7 +124,7 @@ func Test_getDnameTarget(t *testing.T) {
 	msg.Question = []dns.Question{{Name: "sub.example.com.", Qtype: dns.TypeA}}
 
 	// No DNAME record
-	target := getDnameTarget(msg)
+	target := util.DnameTarget(msg)
 	assert.Empty(t, target)
 
 	// Exact-owner match: RFC 6672 §2.3 — the DNAME owner itself is
@@ -137,7 +139,7 @@ func Test_getDnameTarget(t *testing.T) {
 		Target: "target.com.",
 	}
 	msg.Answer = []dns.RR{dname}
-	target = getDnameTarget(msg)
+	target = util.DnameTarget(msg)
 	assert.Empty(t, target, "DNAME owner must not be redirected")
 
 	// Test with subdomain
@@ -152,7 +154,7 @@ func Test_getDnameTarget(t *testing.T) {
 		Target: "newtarget.com.",
 	}
 	msg.Answer = []dns.RR{dname2}
-	target = getDnameTarget(msg)
+	target = util.DnameTarget(msg)
 	assert.Equal(t, "deep.newtarget.com.", target)
 
 	// Cousin name: qname shares a suffix with the DNAME owner but is
@@ -161,7 +163,7 @@ func Test_getDnameTarget(t *testing.T) {
 	// ancestor check the helper would rewrite unrelated names.
 	msg.Question = []dns.Question{{Name: "other.example.com.", Qtype: dns.TypeA}}
 	msg.Answer = []dns.RR{dname2} // DNAME owner is sub.example.com.
-	target = getDnameTarget(msg)
+	target = util.DnameTarget(msg)
 	assert.Empty(t, target, "cousin of DNAME owner must not be redirected")
 }
 
@@ -203,19 +205,9 @@ func Test_verifyRRSIG_RejectsForeignPiggyback(t *testing.T) {
 	}
 	msg := &dns.Msg{Answer: []dns.RR{a, sig, evil}}
 
-	ok, err := verifyRRSIG("example.com.", keys, msg)
+	ok, err := dnssec.VerifyRRSIG("example.com.", keys, msg)
 	assert.False(t, ok)
-	assert.Equal(t, errMissingSigned, err, "foreign RRset must make the whole response bogus")
-}
-
-func Test_checkExponent(t *testing.T) {
-	// Test with invalid base64
-	result := checkExponent("!!!invalid!!!")
-	assert.True(t, result) // Returns true on error
-
-	// Test with too short key
-	result = checkExponent("AQAB") // Very short
-	assert.True(t, result)
+	assert.Equal(t, dnssec.ErrMissingSigned, err, "foreign RRset must make the whole response bogus")
 }
 
 // Test_isSupportedDNSKEYAlgorithm_RSAMD5 locks in the RFC 8624 /
@@ -224,11 +216,11 @@ func Test_checkExponent(t *testing.T) {
 // would be treated as usable and then bogus at RRSIG.Verify time
 // instead of downgraded to insecure.
 func Test_isSupportedDNSKEYAlgorithm_RSAMD5(t *testing.T) {
-	assert.False(t, isSupportedDNSKEYAlgorithm(dns.RSAMD5),
+	assert.False(t, dnssec.IsSupportedDNSKEYAlgorithm(dns.RSAMD5),
 		"RSAMD5 must be treated as unsupported — miekg/dns RRSIG.Verify returns ErrAlg for it")
-	assert.True(t, isSupportedDNSKEYAlgorithm(dns.RSASHA256))
-	assert.True(t, isSupportedDNSKEYAlgorithm(dns.ECDSAP256SHA256))
-	assert.True(t, isSupportedDNSKEYAlgorithm(dns.ED25519))
+	assert.True(t, dnssec.IsSupportedDNSKEYAlgorithm(dns.RSASHA256))
+	assert.True(t, dnssec.IsSupportedDNSKEYAlgorithm(dns.ECDSAP256SHA256))
+	assert.True(t, dnssec.IsSupportedDNSKEYAlgorithm(dns.ED25519))
 }
 
 // Test_filterToZone_NSECNextDomain pins the defense against the
@@ -247,7 +239,7 @@ func Test_filterToZone_NSECNextDomain(t *testing.T) {
 		NextDomain: "zz.example.com.",
 	}
 
-	got := filterToZone([]dns.RR{crossZone, inZone}, "example.com.")
+	got := util.FilterRRsToZone([]dns.RR{crossZone, inZone}, "example.com.")
 	assert.Len(t, got, 1, "NSEC with cross-zone NextDomain must be filtered out")
 	assert.Equal(t, "!.example.com.", got[0].Header().Name)
 }

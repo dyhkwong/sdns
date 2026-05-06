@@ -18,6 +18,7 @@ import (
 	"github.com/semihalev/sdns/cache"
 	"github.com/semihalev/sdns/config"
 	"github.com/semihalev/sdns/middleware"
+	"github.com/semihalev/sdns/middleware/resolver/dnssec"
 	"github.com/semihalev/sdns/util"
 	"github.com/semihalev/zlog/v2"
 	"golang.org/x/sync/errgroup"
@@ -687,7 +688,7 @@ func (r *Resolver) checkDname(ctx context.Context, resp *dns.Msg) (*dns.Msg, err
 		return nil, nil
 	}
 
-	target := getDnameTarget(resp)
+	target := util.DnameTarget(resp)
 	if target == "" {
 		return nil, nil
 	}
@@ -725,11 +726,11 @@ func (r *Resolver) checkDname(ctx context.Context, resp *dns.Msg) (*dns.Msg, err
 func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dns.RR, zone string, extra ...bool) (*dns.Msg, error) {
 	// The internal recursion's target response is held back until
 	// after the outer DNSSEC check. Merging target records into resp
-	// before verifyRRSIG() would force the validator to tolerate
+	// before dnssec.VerifyRRSIG() would force the validator to tolerate
 	// arbitrary out-of-zone names, which an attacker could abuse by
 	// piggybacking unsigned foreign RRsets onto a signed DNAME
 	// answer. By validating the outer response alone and merging the
-	// target data afterward, verifyRRSIG sees only the signer zone's
+	// target data afterward, dnssec.VerifyRRSIG sees only the signer zone's
 	// records and the combined AD still reflects both sides.
 	targetMsg, err := r.checkDname(ctx, resp)
 	if err != nil {
@@ -749,7 +750,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dn
 		// fall into the "unsigned delegation" path and accept
 		// unauthenticated data.
 		if r.dnssec && !r.hasTrustAnchors() {
-			return nil, errTrustAnchorsUnavailable
+			return nil, dnssec.ErrTrustAnchorsUnavailable
 		}
 		q := req.Question[0]
 
@@ -759,15 +760,15 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dn
 			// signatures are acceptable (insecure delegation) or a
 			// real DNSSEC failure (signed zone).
 			if r.isZoneSecure(ctx, q.Name, parentDS, zone) {
-				zlog.Warn("DNSSEC verify failed (answer)", "query", formatQuestion(q), "error", errNoSignatures.Error())
-				return nil, errNoSignatures
+				zlog.Warn("DNSSEC verify failed (answer)", "query", formatQuestion(q), "error", dnssec.ErrNoSignatures.Error())
+				return nil, dnssec.ErrNoSignatures
 			}
 		} else {
 			origDSRR := parentDS
 			var lastErr error
 			settled := false
 			for _, signer := range signers {
-				if err := validateSigner(signer, q.Name); err != nil {
+				if err := dnssec.ValidateSigner(signer, q.Name); err != nil {
 					lastErr = err
 					continue
 				}
@@ -778,7 +779,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dn
 				}
 				if len(candidateDSRR) == 0 {
 					if r.isZoneSecure(ctx, q.Name, origDSRR, zone) {
-						lastErr = errDSRecords
+						lastErr = dnssec.ErrDSRecords
 						continue
 					}
 					// Genuinely insecure for this candidate; accept
@@ -797,7 +798,7 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dn
 			}
 			if !settled {
 				if lastErr == nil {
-					lastErr = errNoSignatures
+					lastErr = dnssec.ErrNoSignatures
 				}
 				zlog.Warn("DNSSEC verify failed (answer)", "query", formatQuestion(q), "error", lastErr.Error())
 				return nil, lastErr
@@ -837,14 +838,14 @@ func (r *Resolver) answer(ctx context.Context, req, resp *dns.Msg, parentDS []dn
 func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS []dns.RR, zone string) (*dns.Msg, error) {
 	if !req.CheckingDisabled {
 		if r.dnssec && !r.hasTrustAnchors() {
-			return nil, errTrustAnchorsUnavailable
+			return nil, dnssec.ErrTrustAnchorsUnavailable
 		}
 		q := req.Question[0]
 
 		signers := r.findRRSIGSigners(resp, q.Name, false)
 		if len(signers) == 0 {
 			if r.isZoneSecure(ctx, q.Name, parentDS, zone) {
-				err := errNoSignatures
+				err := dnssec.ErrNoSignatures
 				zlog.Warn("DNSSEC verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", err.Error())
 				return nil, err
 			}
@@ -857,7 +858,7 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS [
 				chosenSigner string
 			)
 			for _, signer := range signers {
-				if err := validateSigner(signer, q.Name); err != nil {
+				if err := dnssec.ValidateSigner(signer, q.Name); err != nil {
 					lastErr = err
 					continue
 				}
@@ -868,7 +869,7 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS [
 				}
 				if len(candidateDSRR) == 0 {
 					if r.isZoneSecure(ctx, q.Name, origDSRR, zone) {
-						lastErr = errDSRecords
+						lastErr = dnssec.ErrDSRecords
 						continue
 					}
 					// Insecure — accept without AD, stop trying alternates.
@@ -887,7 +888,7 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS [
 			}
 			if !settled {
 				if lastErr == nil {
-					lastErr = errNoSignatures
+					lastErr = dnssec.ErrNoSignatures
 				}
 				zlog.Warn("DNSSEC verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", lastErr.Error())
 				return nil, lastErr
@@ -902,12 +903,12 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS [
 				// queried name/type really doesn't exist.
 				//
 				// Filter NSEC/NSEC3 records to the validated signer
-				// zone: verifyRRSIG only checked signatures for in-
+				// zone: dnssec.VerifyRRSIG only checked signatures for in-
 				// zone records, so out-of-zone NSECs could otherwise
 				// satisfy canonical-coverage checks here without
 				// having been cryptographically authenticated.
-				nsec3Set := filterToZone(extractRRSet(resp.Ns, "", dns.TypeNSEC3), chosenSigner)
-				nsecSet := filterToZone(extractRRSet(resp.Ns, "", dns.TypeNSEC), chosenSigner)
+				nsec3Set := util.FilterRRsToZone(util.ExtractRRSet(resp.Ns, "", dns.TypeNSEC3), chosenSigner)
+				nsecSet := util.FilterRRsToZone(util.ExtractRRSet(resp.Ns, "", dns.TypeNSEC), chosenSigner)
 				isNegative := resp.Rcode == dns.RcodeNameError ||
 					(resp.Rcode == dns.RcodeSuccess && len(resp.Answer) == 0)
 
@@ -915,31 +916,31 @@ func (r *Resolver) authority(ctx context.Context, req, resp *dns.Msg, parentDS [
 					switch {
 					case len(nsec3Set) > 0:
 						if resp.Rcode == dns.RcodeNameError {
-							if err := verifyNameError(resp, nsec3Set); err != nil {
+							if err := dnssec.VerifyNameError(resp, nsec3Set); err != nil {
 								zlog.Warn("NSEC3 verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", err.Error())
 								return nil, err
 							}
 						} else {
-							if err := verifyNODATA(resp, nsec3Set); err != nil {
+							if err := dnssec.VerifyNODATA(resp, nsec3Set); err != nil {
 								zlog.Warn("NSEC3 verify failed (NODATA)", "query", formatQuestion(q), "error", err.Error())
 								return nil, err
 							}
 						}
 					case len(nsecSet) > 0:
 						if resp.Rcode == dns.RcodeNameError {
-							if err := verifyNameErrorNSEC(resp, nsecSet); err != nil {
+							if err := dnssec.VerifyNameErrorNSEC(resp, nsecSet); err != nil {
 								zlog.Warn("NSEC verify failed (NXDOMAIN)", "query", formatQuestion(q), "error", err.Error())
 								return nil, err
 							}
 						} else {
-							if err := verifyNODATANSEC(resp, nsecSet); err != nil {
+							if err := dnssec.VerifyNODATANSEC(resp, nsecSet); err != nil {
 								zlog.Warn("NSEC verify failed (NODATA)", "query", formatQuestion(q), "error", err.Error())
 								return nil, err
 							}
 						}
 					default:
 						zlog.Warn("Negative answer missing NSEC/NSEC3 denial proof", "query", formatQuestion(q), "rcode", dns.RcodeToString[resp.Rcode])
-						return nil, errNSECMissingCoverage
+						return nil, dnssec.ErrNSECMissingCoverage
 					}
 				}
 
@@ -967,100 +968,13 @@ func (r *Resolver) lookup(ctx context.Context, rs *resolveState, req *dns.Msg, s
 	configErrors := []*dns.Msg{}
 	fatalErrors := []error{}
 
-	// Result type for parallel queries
-	type result struct {
-		resp   *dns.Msg
-		err    error
-		server *authority.Server
-	}
-
 	// Single unbuffered channel. Stragglers whose result arrives after
 	// lookup has picked a winner drop their send via ctx.Done() — the
 	// WithCancel ctx below is the cancellation signal, so we don't
 	// need a separate "returned" channel.
-	results := make(chan result)
+	results := make(chan lookupResult)
 
-	// Start a DNS query to a server
-	originalId := req.Id // Capture ID before goroutines start
-	queryServer := func(ctx context.Context, reqCopy *dns.Msg, server *authority.Server) {
-		defer ReleaseMsg(reqCopy)
-
-		// releaseSlot frees the semaphore slot acquired by the main
-		// loop before this goroutine was launched. We must release
-		// before a blocking send on results (or before returning
-		// without a send), otherwise a small MaxConcurrentQueries
-		// setting deadlocks the lookup: the main loop blocks trying
-		// to acquire a slot for the next server while this worker
-		// holds its own slot blocked on a send the main loop never
-		// reaches.
-		slotReleased := false
-		releaseSlot := func() {
-			if !slotReleased {
-				<-r.maxConcurrent
-				slotReleased = true
-			}
-		}
-		defer releaseSlot()
-
-		var res result
-		res.server = server
-
-		switch {
-		case !r.circuitBreaker.canQuery(server.Addr):
-			res.err = fatalError(errConnectionFailed)
-		case ctx.Err() != nil:
-			return
-		default:
-			reqCopy.Id = dns.Id() // anti-spoofing
-			resp, err := r.exchange(ctx, rs, "udp", reqCopy, server, 0)
-			if resp != nil {
-				resp.Id = originalId
-			}
-			switch {
-			case err != nil:
-				r.circuitBreaker.recordFailure(server.Addr)
-			case resp != nil:
-				// Any response from the authority — NOERROR,
-				// NXDOMAIN, NODATA — proves the server is
-				// reachable and answering, so reset the failure
-				// streak. Scoping recovery to RcodeSuccess only
-				// leaves healthy servers tripped when they keep
-				// (correctly) returning negative answers
-				// interleaved with transient timeouts.
-				r.circuitBreaker.recordSuccess(server.Addr)
-			}
-			res.resp = resp
-			res.err = err
-		}
-
-		// Release before the send so the main loop can keep
-		// launching workers while we queue the result.
-		releaseSlot()
-		select {
-		case results <- res:
-		case <-ctx.Done():
-		}
-	}
-
-	// calculateTimeout returns adaptive timeout based on server RTT
-	calculateTimeout := func(server *authority.Server) time.Duration {
-		rtt := time.Duration(atomic.LoadInt64(&server.Rtt))
-		if rtt <= 0 {
-			// Unknown RTT, use conservative default
-			return 100 * time.Millisecond
-		}
-		// Give server 2x its average RTT before trying next
-		timeout := rtt * 2
-		// Clamp timeout to reasonable bounds
-		switch {
-		case timeout < 25*time.Millisecond:
-			return 25 * time.Millisecond
-		case timeout > 300*time.Millisecond:
-			return 300 * time.Millisecond
-		default:
-			return timeout
-		}
-	}
+	originalID := req.Id // Capture ID before goroutines start
 
 	// Start the timer for the fallback racer.
 	fallbackTimer := time.NewTimer(150 * time.Millisecond)
@@ -1096,7 +1010,7 @@ mainloop:
 		select {
 		case r.maxConcurrent <- struct{}{}:
 			// Got a slot, start the query
-			go queryServer(ctx, serverReq, server)
+			go r.queryServer(ctx, rs, originalID, serverReq, server, results)
 		case <-ctx.Done():
 			// Context cancelled while waiting for slot —
 			// return the pre-copied pooled message before
@@ -1112,7 +1026,7 @@ mainloop:
 		}
 
 		// Use adaptive timeout for subsequent servers
-		fallbackTimeout := calculateTimeout(server)
+		fallbackTimeout := adaptiveServerTimeout(server)
 
 	fallbackloop:
 		for left != 0 {
@@ -1183,26 +1097,122 @@ mainloop:
 		}
 	}
 
+	return pickFallbackResponse(responseErrors, configErrors, fatalErrors)
+}
+
+// lookupResult bundles a single per-server query outcome for the
+// fan-out loop in (*Resolver).lookup.
+type lookupResult struct {
+	resp   *dns.Msg
+	err    error
+	server *authority.Server
+}
+
+// queryServer issues one UDP exchange to server and ships the outcome on
+// results. It owns the semaphore slot the caller acquired before
+// launching the goroutine, and the pooled reqCopy buffer; both are
+// released before the result send so the main loop can keep launching
+// workers while we queue.
+func (r *Resolver) queryServer(ctx context.Context, rs *resolveState, originalID uint16, reqCopy *dns.Msg, server *authority.Server, results chan<- lookupResult) {
+	defer ReleaseMsg(reqCopy)
+
+	// releaseSlot frees the semaphore slot acquired by the main
+	// loop before this goroutine was launched. We must release
+	// before a blocking send on results (or before returning
+	// without a send), otherwise a small MaxConcurrentQueries
+	// setting deadlocks the lookup: the main loop blocks trying
+	// to acquire a slot for the next server while this worker
+	// holds its own slot blocked on a send the main loop never
+	// reaches.
+	slotReleased := false
+	releaseSlot := func() {
+		if !slotReleased {
+			<-r.maxConcurrent
+			slotReleased = true
+		}
+	}
+	defer releaseSlot()
+
+	res := lookupResult{server: server}
+
+	switch {
+	case !r.circuitBreaker.canQuery(server.Addr):
+		res.err = fatalError(errConnectionFailed)
+	case ctx.Err() != nil:
+		return
+	default:
+		reqCopy.Id = dns.Id() // anti-spoofing
+		resp, err := r.exchange(ctx, rs, "udp", reqCopy, server, 0)
+		if resp != nil {
+			resp.Id = originalID
+		}
+		switch {
+		case err != nil:
+			r.circuitBreaker.recordFailure(server.Addr)
+		case resp != nil:
+			// Any response from the authority — NOERROR,
+			// NXDOMAIN, NODATA — proves the server is
+			// reachable and answering, so reset the failure
+			// streak. Scoping recovery to RcodeSuccess only
+			// leaves healthy servers tripped when they keep
+			// (correctly) returning negative answers
+			// interleaved with transient timeouts.
+			r.circuitBreaker.recordSuccess(server.Addr)
+		}
+		res.resp = resp
+		res.err = err
+	}
+
+	// Release before the send so the main loop can keep
+	// launching workers while we queue the result.
+	releaseSlot()
+	select {
+	case results <- res:
+	case <-ctx.Done():
+	}
+}
+
+// adaptiveServerTimeout picks how long lookup waits on a single server
+// before racing the next candidate. With no RTT samples the result is a
+// conservative 100ms; otherwise it is 2× the observed RTT clamped to
+// [25ms, 300ms] so a single slow outlier can't stall the whole fan-out.
+func adaptiveServerTimeout(server *authority.Server) time.Duration {
+	rtt := time.Duration(atomic.LoadInt64(&server.Rtt))
+	if rtt <= 0 {
+		return 100 * time.Millisecond
+	}
+	timeout := rtt * 2
+	switch {
+	case timeout < 25*time.Millisecond:
+		return 25 * time.Millisecond
+	case timeout > 300*time.Millisecond:
+		return 300 * time.Millisecond
+	default:
+		return timeout
+	}
+}
+
+// pickFallbackResponse selects what to return when the lookup loop
+// exhausts every authority without a clean success: prefer NXDOMAIN over
+// other rcodes, then any negative response, then the bogus-delegation
+// list, then a connection error, then the absolute-last-resort no-roots
+// fatal.
+func pickFallbackResponse(responseErrors, configErrors []*dns.Msg, fatalErrors []error) (*dns.Msg, error) {
 	if len(responseErrors) > 0 {
 		for _, resp := range responseErrors {
-			// if we have other errors, we can try choose nameerror first
 			if resp.Rcode == dns.RcodeNameError {
 				return resp, nil
 			}
 		}
 		return responseErrors[0], nil
 	}
-
 	if len(configErrors) > 0 {
 		return configErrors[0], nil
 	}
-
 	if len(fatalErrors) > 0 {
 		return nil, fatalError(errConnectionFailed)
 	}
-
 	zlog.Fatal("Looks like no root servers, check your config")
-
 	return nil, fatalError(errNoRootServers)
 }
 
@@ -1560,7 +1570,7 @@ func (r *Resolver) findRRSIGSigners(resp *dns.Msg, qname string, inAnswer bool) 
 
 	// Prefer the most specific (longest-labeled) signer first so the
 	// legitimate zone apex is tried ahead of any shallower ancestor an
-	// attacker might have injected. validateSigner will reject any
+	// attacker might have injected. dnssec.ValidateSigner will reject any
 	// candidate that isn't an ancestor of qname, so the candidate set
 	// is naturally bounded by the number of ancestor zones of qname;
 	// truncating the slice would only let an attacker pad with bogus
@@ -1592,7 +1602,7 @@ func (r *Resolver) findDS(ctx context.Context, signer, qname string, parentDS []
 					return nil, err
 				}
 
-				parentDS = extractRRSet(dsResp.Answer, candidate, dns.TypeDS)
+				parentDS = util.ExtractRRSet(dsResp.Answer, candidate, dns.TypeDS)
 				if len(parentDS) == 0 {
 					break
 				}
@@ -1607,7 +1617,7 @@ func (r *Resolver) findDS(ctx context.Context, signer, qname string, parentDS []
 				return nil, err
 			}
 
-			parentDS = extractRRSet(dsResp.Answer, signer, dns.TypeDS)
+			parentDS = util.ExtractRRSet(dsResp.Answer, signer, dns.TypeDS)
 		}
 	}
 
@@ -1683,7 +1693,7 @@ func (r *Resolver) isZoneSecure(ctx context.Context, qname string, parentDS []dn
 // are tolerated as insecure data rather than flagged bogus.
 func hasSupportedDS(dsset []dns.RR) bool {
 	for _, rr := range dsset {
-		if ds, ok := rr.(*dns.DS); ok && isSupportedDS(ds) {
+		if ds, ok := rr.(*dns.DS); ok && dnssec.IsSupportedDS(ds) {
 			return true
 		}
 	}
@@ -2082,11 +2092,11 @@ func (r *Resolver) verifyRootKeys(msg *dns.Msg) (ok bool) {
 		zlog.Fatal("Root zone dsset empty")
 	}
 
-	if _, err := verifyDS(keys, dsset); err != nil {
+	if _, err := dnssec.VerifyDS(keys, dsset); err != nil {
 		zlog.Fatal("Root zone DS not verified")
 	}
 
-	if _, err := verifyRRSIG(rootzone, keys, msg); err != nil {
+	if _, err := dnssec.VerifyRRSIG(rootzone, keys, msg); err != nil {
 		zlog.Fatal("Root zone keys not verified")
 	}
 
@@ -2144,14 +2154,14 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 	}
 
 	if len(keys) == 0 {
-		return false, errNoDNSKEY
+		return false, dnssec.ErrNoDNSKEY
 	}
 
 	if len(parentdsRR) == 0 {
 		return false, fmt.Errorf("DS RR set empty")
 	}
 
-	unsupportedOnly, err := verifyDS(keys, parentdsRR)
+	unsupportedOnly, err := dnssec.VerifyDS(keys, parentdsRR)
 	if err != nil {
 		zlog.Debug("DNSSEC DS verify failed", "signer", signer, "signed", signed, "error", err.Error(), "unsupported only", unsupportedOnly)
 		if unsupportedOnly {
@@ -2168,7 +2178,7 @@ func (r *Resolver) verifyDNSSEC(ctx context.Context, signer, signed string, resp
 		return false, nil
 	}
 
-	if ok, err = verifyRRSIG(signer, keys, resp); err != nil {
+	if ok, err = dnssec.VerifyRRSIG(signer, keys, resp); err != nil {
 		return
 	}
 
@@ -2541,7 +2551,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 	// recovers the cached entry would still make signed zones look
 	// insecure to later CD=false lookups via searchCache.
 	if r.dnssec && !r.hasTrustAnchors() {
-		return nil, errTrustAnchorsUnavailable
+		return nil, dnssec.ErrTrustAnchorsUnavailable
 	}
 
 	signers := r.findRRSIGSigners(resp, q.Name, false)
@@ -2553,8 +2563,8 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 		// unsupported DS records (unknown digest or DNSKEY algorithm)
 		// fall through to the insecure treatment below instead of
 		// SERVFAIL-ing on data the validator can't use anyway.
-		zlog.Warn("DNSSEC verify failed (delegation)", "query", formatQuestion(q), "error", errDSRecords.Error())
-		return nil, errDSRecords
+		zlog.Warn("DNSSEC verify failed (delegation)", "query", formatQuestion(q), "error", dnssec.ErrDSRecords.Error())
+		return nil, dnssec.ErrDSRecords
 	}
 
 	origDSRR := parentDS
@@ -2571,8 +2581,8 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 			// Parent chain declares the child is signed with usable DS
 			// but no RRSIG is present — bogus. Every DS unsupported is
 			// insecure per RFC 6840 §5.2 and falls through below.
-			zlog.Warn("DNSSEC verify failed (delegation)", "query", formatQuestion(q), "error", errDSRecords.Error())
-			return nil, errDSRecords
+			zlog.Warn("DNSSEC verify failed (delegation)", "query", formatQuestion(q), "error", dnssec.ErrDSRecords.Error())
+			return nil, dnssec.ErrDSRecords
 		}
 		return parentDS, nil
 	}
@@ -2590,7 +2600,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 		chosenSigner string
 	)
 	for _, signer := range signers {
-		if err := validateSigner(signer, q.Name); err != nil {
+		if err := dnssec.ValidateSigner(signer, q.Name); err != nil {
 			lastErr = err
 			continue
 		}
@@ -2601,7 +2611,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 		}
 		if len(candidateDSRR) == 0 {
 			if r.isZoneSecure(ctx, q.Name, origDSRR, "") {
-				lastErr = errDSRecords
+				lastErr = dnssec.ErrDSRecords
 				continue
 			}
 			// Insecure for this candidate.
@@ -2627,7 +2637,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 			settled = true
 			break
 		}
-		childDS = extractRRSet(resp.Ns, q.Name, dns.TypeDS)
+		childDS = util.ExtractRRSet(resp.Ns, q.Name, dns.TypeDS)
 		finalDS = candidateDSRR
 		chosenSigner = signer
 		verified = true
@@ -2636,7 +2646,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 	}
 	if !settled {
 		if lastErr == nil {
-			lastErr = errDSRecords
+			lastErr = dnssec.ErrDSRecords
 		}
 		return nil, lastErr
 	}
@@ -2655,16 +2665,16 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 	// Zone-filter the denial proofs to the validated signer so an
 	// attacker-injected NSEC/NSEC3 from an unrelated sibling zone
 	// cannot structurally satisfy the delegation check.
-	if nsec3Set := filterToZone(extractRRSet(resp.Ns, "", dns.TypeNSEC3), chosenSigner); len(nsec3Set) > 0 {
-		if err := verifyDelegation(q.Name, nsec3Set); err != nil {
+	if nsec3Set := util.FilterRRsToZone(util.ExtractRRSet(resp.Ns, "", dns.TypeNSEC3), chosenSigner); len(nsec3Set) > 0 {
+		if err := dnssec.VerifyDelegation(q.Name, nsec3Set); err != nil {
 			zlog.Warn("NSEC3 verify failed (delegation)", "query", formatQuestion(q), "error", err.Error())
 			return nil, err
 		}
 		return []dns.RR{}, nil
 	}
 
-	if nsecSet := filterToZone(extractRRSet(resp.Ns, "", dns.TypeNSEC), chosenSigner); len(nsecSet) > 0 {
-		if err := verifyDelegationNSEC(q.Name, nsecSet); err != nil {
+	if nsecSet := util.FilterRRsToZone(util.ExtractRRSet(resp.Ns, "", dns.TypeNSEC), chosenSigner); len(nsecSet) > 0 {
+		if err := dnssec.VerifyDelegationNSEC(q.Name, nsecSet); err != nil {
 			zlog.Warn("NSEC verify failed (delegation)", "query", formatQuestion(q), "error", err.Error())
 			return nil, err
 		}
@@ -2672,7 +2682,7 @@ func (r *Resolver) validateDelegation(ctx context.Context, req, resp *dns.Msg, q
 	}
 
 	zlog.Warn("Delegation missing DS and NSEC/NSEC3 proof", "query", formatQuestion(q))
-	return nil, errNSECMissingCoverage
+	return nil, dnssec.ErrNSECMissingCoverage
 }
 
 // resolveWithCachedNameservers handles resolution with cached nameservers.
