@@ -124,8 +124,11 @@ type ViewConfig struct {
 type KubernetesConfig struct {
 	Enabled       bool   `toml:"enabled"`
 	ClusterDomain string `toml:"cluster_domain"`
-	KillerMode    bool   `toml:"killer_mode"`
-	Kubeconfig    string `toml:"kubeconfig"`
+	// KillerMode is deprecated and ignored. The kubernetes middleware
+	// always uses the sharded registry; the field is retained so
+	// older configs parse without error. Remove it from new configs.
+	KillerMode bool   `toml:"killer_mode"`
+	Kubeconfig string `toml:"kubeconfig"`
 	// Demo populates the registry with synthetic services so the
 	// middleware can be exercised without a real cluster
 	// (development / tests). It is NEVER safe to enable in
@@ -583,10 +586,6 @@ enabled = false
 # Kubernetes cluster domain suffix
 # Default domain for Kubernetes DNS queries
 cluster_domain = "cluster.local"
-
-# Enable Kubernetes killer mode
-# High-performance mode with ML-based prediction and zero-allocation caching
-killer_mode = false
 
 # Path to kubeconfig file
 # Leave empty to use in-cluster config or ~/.kube/config

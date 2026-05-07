@@ -2,7 +2,6 @@ package kubernetes
 
 import (
 	"testing"
-	"time"
 
 	"github.com/miekg/dns"
 	corev1 "k8s.io/api/core/v1"
@@ -364,87 +363,9 @@ func TestIPv6SupportMethods(t *testing.T) {
 	}
 }
 
-// TestResolverCacheIntegration tests resolver cache integration
-func TestResolverCacheIntegration(t *testing.T) {
-	r := NewResolver(nil, "cluster.local", NewCache())
-
-	// Add a service
-	r.registry.AddService(&Service{ //nolint:gosec // G104 - test setup
-		Name:       "cached-svc",
-		Namespace:  "default",
-		ClusterIPs: [][]byte{{10, 96, 0, 50}},
-		IPFamilies: []string{"IPv4"},
-	})
-
-	// First query should hit registry and cache
-	resp1, found := r.Resolve("cached-svc.default.svc.cluster.local.", dns.TypeA)
-	if !found {
-		t.Fatal("Service not found")
-	}
-	if resp1.Rcode != dns.RcodeSuccess {
-		t.Error("Expected success response")
-	}
-
-	// Second query should hit cache
-	resp2, found := r.Resolve("cached-svc.default.svc.cluster.local.", dns.TypeA)
-	if !found {
-		t.Fatal("Cached service not found")
-	}
-	if resp2.Rcode != dns.RcodeSuccess {
-		t.Error("Expected success response from cache")
-	}
-}
-
-// TestCacheWithTTL tests cache TTL handling
-func TestCacheWithTTL(t *testing.T) {
-	cache := NewCache()
-
-	// Test with various TTLs
-	msg := &dns.Msg{}
-	msg.SetQuestion("test.cluster.local.", dns.TypeA)
-
-	// Add answer with very low TTL (minimum 1 second to be cached)
-	msg.Answer = []dns.RR{
-		&dns.A{
-			Hdr: dns.RR_Header{
-				Name:   "test.cluster.local.",
-				Rrtype: dns.TypeA,
-				Class:  dns.ClassINET,
-				Ttl:    1, // 1 second TTL
-			},
-			A: []byte{10, 0, 0, 1},
-		},
-	}
-
-	cache.Set("test.cluster.local.", dns.TypeA, msg)
-
-	// Should be cached
-	cached := cache.Get("test.cluster.local.", dns.TypeA)
-	if cached == nil {
-		t.Error("Cache should store with low TTL")
-	}
-}
-
-// TestHighPerformanceCacheCleanup tests cleanup functionality
-func TestHighPerformanceCacheCleanup(t *testing.T) {
-	cache := NewZeroAllocCache()
-
-	// Store some entries
-	for i := 0; i < 10; i++ {
-		msg := &dns.Msg{}
-		msg.SetQuestion("test.cluster.local.", dns.TypeA)
-		msg.Response = true
-		cache.Store("test.cluster.local.", dns.TypeA, msg)
-	}
-
-	// Force cleanup by manipulating expiry (would need to expose internals)
-	// For now just test that cleanup doesn't crash
-	time.Sleep(100 * time.Millisecond)
-}
-
-// TestShardedRegistryDeleteService tests service deletion
-func TestShardedRegistryDeleteService(t *testing.T) {
-	r := NewShardedRegistry()
+// TestRegistryServiceUpdate tests service overwrite semantics.
+func TestRegistryServiceUpdate(t *testing.T) {
+	r := NewRegistry()
 
 	// Add service
 	r.AddService(&Service{
@@ -455,7 +376,7 @@ func TestShardedRegistryDeleteService(t *testing.T) {
 	})
 
 	// Verify it exists
-	answers, found := r.ResolveQuery("test.default.svc.cluster.local.", dns.TypeA)
+	answers, _, found := r.ResolveQuery("test.default.svc.cluster.local.", dns.TypeA)
 	if !found || len(answers) == 0 {
 		t.Fatal("Service not found")
 	}
@@ -470,7 +391,7 @@ func TestShardedRegistryDeleteService(t *testing.T) {
 	})
 
 	// Verify IP changed
-	answers, found = r.ResolveQuery("test.default.svc.cluster.local.", dns.TypeA)
+	answers, _, found = r.ResolveQuery("test.default.svc.cluster.local.", dns.TypeA)
 	if !found || len(answers) == 0 {
 		t.Fatal("Service not found after update")
 	}

@@ -100,49 +100,6 @@ func TestHeadlessServiceEndpoints(t *testing.T) {
 		}
 	})
 
-	// Test boring mode (uses standard registry)
-	t.Run("boring_mode", func(t *testing.T) {
-		cfg := &config.Config{
-			Kubernetes: config.KubernetesConfig{
-				Enabled:    false,
-				Demo:       true,
-				KillerMode: false,
-			},
-		}
-
-		k := New(cfg)
-
-		// Add a headless service
-		k.resolver.registry.AddService(&Service{ //nolint:gosec // G104 - test setup
-			Name:      "myapp",
-			Namespace: "default",
-			Headless:  true,
-		})
-
-		// Add endpoints
-		k.resolver.registry.SetEndpoints("myapp", "default", []Endpoint{ //nolint:gosec // G104 - test setup
-			{Addresses: []string{"10.2.2.1"}, Ready: true},
-			{Addresses: []string{"10.2.2.2"}, Ready: true},
-		})
-
-		// Test query
-		ctx := context.Background()
-		req := new(dns.Msg)
-		req.SetQuestion("myapp.default.svc.cluster.local.", dns.TypeA)
-
-		w := &mockResponseWriter{}
-		ch := &middleware.Chain{
-			Writer:  w,
-			Request: req,
-		}
-
-		k.ServeDNS(ctx, ch)
-
-		// Check response
-		if !w.written || w.msg == nil || len(w.msg.Answer) != 2 {
-			t.Errorf("Expected 2 A records for headless service in boring mode")
-		}
-	})
 }
 
 // TestHeadlessServiceNoEndpoints tests headless service with no endpoints
@@ -191,7 +148,7 @@ func TestHeadlessServiceNoEndpoints(t *testing.T) {
 
 // TestEndpointOperations tests endpoint add/remove operations
 func TestEndpointOperations(t *testing.T) {
-	r := NewShardedRegistry()
+	r := NewRegistry()
 
 	// Test SetEndpoints
 	r.SetEndpoints("test", "default", []Endpoint{
@@ -229,11 +186,10 @@ func TestEndpointOperations(t *testing.T) {
 	}
 }
 
-// TestShardedRegistryStats tests that stats include endpoint sets
-func TestShardedRegistryStats(t *testing.T) {
-	r := NewShardedRegistry()
+// TestRegistryStats tests that stats include endpoint sets.
+func TestRegistryStats(t *testing.T) {
+	r := NewRegistry()
 
-	// Add some data
 	r.AddService(&Service{
 		Name:       "test",
 		Namespace:  "default",
@@ -248,7 +204,7 @@ func TestShardedRegistryStats(t *testing.T) {
 		{Addresses: []string{"10.1.1.2"}, Ready: true},
 	})
 
-	stats := r.GetStats()
+	stats := r.Stats()
 
 	if stats["endpoint_sets"] < 2 {
 		t.Errorf("Expected at least 2 endpoint sets in stats, got %d", stats["endpoint_sets"])

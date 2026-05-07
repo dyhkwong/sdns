@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,112 +16,119 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/homedir"
 )
 
-// registryWriter is the subset of registry operations the
-// informer callbacks use to populate a live cluster registry.
-// Kubernetes.New passes in the registry that ServeDNS actually
-// reads from — boring mode wires in the resolver's *Registry,
-// killer mode wires in a *ShardedRegistry via shardedWriter.
-// Previously the client kept its own private *Registry that
-// nothing ever read, so a connected cluster answered with an
-// empty dataset.
-type registryWriter interface {
-	AddService(*Service) error
-	DeleteService(name, namespace string) error
-	AddPod(*Pod) error
-	DeletePod(name, namespace string) error
-	SetEndpoints(service, namespace string, endpoints []Endpoint) error
-}
+// rebuildDebounce is the worker's wait window before flushing
+// pending rebuilds so a burst of slice events for one service
+// collapses into a single rebuild.
+const rebuildDebounce = 50 * time.Millisecond
 
-// shardedWriter adapts *ShardedRegistry to registryWriter.
-// ShardedRegistry's mutators don't return errors, so the adapter
-// swallows nil and always reports success.
-type shardedWriter struct {
-	r *ShardedRegistry
-}
-
-func (w *shardedWriter) AddService(s *Service) error {
-	w.r.AddService(s)
-	return nil
-}
-
-func (w *shardedWriter) DeleteService(name, namespace string) error {
-	w.r.DeleteService(name, namespace)
-	return nil
-}
-
-func (w *shardedWriter) AddPod(p *Pod) error {
-	w.r.AddPod(p)
-	return nil
-}
-
-func (w *shardedWriter) DeletePod(name, namespace string) error {
-	w.r.DeletePod(name, namespace)
-	return nil
-}
-
-func (w *shardedWriter) SetEndpoints(service, namespace string, endpoints []Endpoint) error {
-	w.r.SetEndpoints(service, namespace, endpoints)
-	return nil
-}
-
-// Client connects to Kubernetes API.
+// Client connects to the Kubernetes API.
 type Client struct {
 	clientset kubernetes.Interface
-	registry  registryWriter
+	registry  *Registry
 	stopCh    chan struct{}
 	cancel    context.CancelFunc
 	stopped   chan struct{}
 
 	// synced flips to true once informers have populated the
-	// registry. ServeDNS gates authoritative answers on this
-	// so a still-warming-up or disconnected client doesn't
-	// return NXDOMAIN against an empty registry for real
-	// cluster names.
+	// registry. ServeDNS gates authoritative answers on this so
+	// a warming-up or disconnected client doesn't return NXDOMAIN
+	// for valid cluster names.
 	synced atomic.Bool
 
-	// slicesByService aggregates EndpointSlice contents per
-	// service. A single service can have many slices; the
-	// registry stores one endpoint list per service, so every
-	// slice event must recompute the union.
+	// slicesByService records UID-tracked slice contributions per
+	// namespace/name. tombstones holds the UID of the most recently
+	// deleted Service so a late slice event that arrives after the
+	// delete is rejected before re-populating state.
 	slicesMu        sync.Mutex
-	slicesByService map[string]map[string][]Endpoint
+	slicesByService map[string]*serviceSlices
+	tombstones      map[string]types.UID
+
+	queue           *rebuildQueue
+	rebuildDebounce time.Duration
+
+	// rebuilds counts per-service rebuilds (ops signal).
+	rebuilds atomic.Uint64
 }
 
-// Synced reports whether the informer caches have populated
-// the registry at least once.
+// serviceSlices tracks one service's slice events. svcUID is empty
+// until the Service is observed (endpoints-before-service ordering).
+// dirtySlices is the set forwarded to the registry on the next
+// worker drain.
+type serviceSlices struct {
+	svcUID        types.UID
+	slices        map[string][]Endpoint
+	sliceOwnerUID map[string]types.UID
+	dirtySlices   map[string]struct{}
+}
+
+// rebuildQueue is a set-typed work queue with a buffered (cap=1)
+// notify channel. running gates scheduleRebuild; processingMu
+// serialises drain dispatch so flushRebuilds can wait for an
+// in-flight worker cycle to finish.
+type rebuildQueue struct {
+	mu           sync.Mutex
+	pending      map[string]struct{}
+	notify       chan struct{}
+	running      atomic.Bool
+	processingMu sync.Mutex
+}
+
+func newRebuildQueue() *rebuildQueue {
+	return &rebuildQueue{
+		pending: map[string]struct{}{},
+		notify:  make(chan struct{}, 1),
+	}
+}
+
+func (q *rebuildQueue) enqueue(key string) {
+	q.mu.Lock()
+	q.pending[key] = struct{}{}
+	q.mu.Unlock()
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+func (q *rebuildQueue) drain() []string {
+	q.mu.Lock()
+	keys := make([]string, 0, len(q.pending))
+	for k := range q.pending {
+		keys = append(keys, k)
+		delete(q.pending, k)
+	}
+	q.mu.Unlock()
+	return keys
+}
+
+// Synced reports whether the informer caches have populated the
+// registry at least once.
 func (c *Client) Synced() bool {
 	return c.synced.Load()
 }
 
-// NewClient creates a new Kubernetes client. The registry
-// parameter is the sink informer callbacks populate; passing the
-// ServeDNS-facing registry wires live cluster state into query
-// answers. A nil registry is rejected — nothing would be wired
-// up, and silent no-ops hide config bugs.
-func NewClient(kubeconfig string, registry registryWriter) (*Client, error) {
+// NewClient creates a new Kubernetes client wired to registry.
+func NewClient(kubeconfig string, registry *Registry) (*Client, error) {
 	if registry == nil {
 		return nil, fmt.Errorf("kubernetes client: registry is nil")
 	}
-	// Build config - will use provided kubeconfig, in-cluster config, or ~/.kube/config
 	cfg, err := buildConfig(kubeconfig)
 	if err != nil {
 		return nil, err
 	}
 
-	// Create clientset
 	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		return nil, err
 	}
 
-	// Test connection
 	_, err = clientset.Discovery().ServerVersion()
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to kubernetes: %w", err)
@@ -132,6 +139,7 @@ func NewClient(kubeconfig string, registry registryWriter) (*Client, error) {
 		registry:  registry,
 		stopCh:    make(chan struct{}),
 		stopped:   make(chan struct{}),
+		queue:     newRebuildQueue(),
 	}, nil
 }
 
@@ -185,81 +193,95 @@ func (c *Client) Run(ctx context.Context) error {
 		0,
 	)
 
-	// Add event handlers with error recovery
-	serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{ //nolint:gosec // G104 - event handler registration
+	// Capture the per-handler registrations so we can wait on each
+	// HasSynced — informer-level HasSynced only reports the store
+	// is populated, not that our AddFunc ran for every item.
+	serviceReg, err := serviceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.safeServiceAdd,
 		UpdateFunc: c.safeServiceUpdate,
 		DeleteFunc: c.safeServiceDelete,
 	})
+	if err != nil {
+		return fmt.Errorf("register service handler: %w", err)
+	}
 
-	endpointSliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{ //nolint:gosec // G104 - event handler registration
+	endpointSliceReg, err := endpointSliceInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.safeEndpointSliceAdd,
 		UpdateFunc: c.safeEndpointSliceUpdate,
 		DeleteFunc: c.safeEndpointSliceDelete,
 	})
+	if err != nil {
+		return fmt.Errorf("register endpointslice handler: %w", err)
+	}
 
-	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{ //nolint:gosec // G104 - event handler registration
+	podReg, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    c.safePodAdd,
 		UpdateFunc: c.safePodUpdate,
 		DeleteFunc: c.safePodDelete,
 	})
+	if err != nil {
+		return fmt.Errorf("register pod handler: %w", err)
+	}
 
-	// Start informers
+	// Start the rebuild worker before informers so events arriving
+	// during the initial sync are coalesced too. startRebuildWorker
+	// flips running synchronously to avoid an inline-rebuild race.
+	workerDone := c.startRebuildWorker(ctx)
+
 	go serviceInformer.Run(ctx.Done())
 	go endpointSliceInformer.Run(ctx.Done())
 	go podInformer.Run(ctx.Done())
 
-	// Wait for caches to sync
 	if !cache.WaitForCacheSync(ctx.Done(),
 		serviceInformer.HasSynced,
 		endpointSliceInformer.HasSynced,
-		podInformer.HasSynced) {
+		podInformer.HasSynced,
+		serviceReg.HasSynced,
+		endpointSliceReg.HasSynced,
+		podReg.HasSynced) {
 		return fmt.Errorf("failed to sync caches")
 	}
+
+	// Drain queued rebuilds before publishing synced so ServeDNS
+	// doesn't NODATA valid headless names during the debounce window.
+	c.flushRebuilds()
 
 	c.synced.Store(true)
 	zlog.Info("Kubernetes caches synced")
 
-	// Wait for context cancellation or stop signal
 	select {
 	case <-ctx.Done():
 	case <-c.stopCh:
 	}
 
-	// Cancel context to stop informers
 	if c.cancel != nil {
 		c.cancel()
 	}
 
+	<-workerDone
 	return nil
 }
 
-// Stop stops the client and waits for cleanup
+// Stop stops the client and waits for cleanup.
 func (c *Client) Stop() {
-	// Signal stop
 	select {
 	case <-c.stopCh:
-		// Already stopped
 		return
 	default:
 		close(c.stopCh)
 	}
 
-	// Cancel context if available
 	if c.cancel != nil {
 		c.cancel()
 	}
 
-	// Wait for Run to complete
 	select {
 	case <-c.stopped:
 	case <-time.After(ClientStopTimeout):
-		// Timeout after ClientStopTimeout
 		zlog.Warn("Client stop timeout after", zlog.String("timeout", ClientStopTimeout.String()))
 	}
 }
 
-// Safe wrappers for event handlers
 func (c *Client) safeServiceAdd(obj any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -293,7 +315,6 @@ func (c *Client) safeServiceDelete(obj any) {
 	c.onServiceDelete(obj)
 }
 
-// Service handlers
 func (c *Client) onServiceAdd(obj any) {
 	svc, ok := obj.(*corev1.Service)
 	if !ok {
@@ -301,13 +322,10 @@ func (c *Client) onServiceAdd(obj any) {
 			zlog.String("type", fmt.Sprintf("%T", obj)))
 		return
 	}
-	service := c.convertService(svc)
-	if err := c.registry.AddService(service); err != nil {
-		zlog.Error("Failed to add service to registry",
-			zlog.String("service", svc.Name),
-			zlog.String("namespace", svc.Namespace),
-			zlog.String("error", err.Error()))
-	}
+	c.bindServiceUID(svc)
+	c.markAllSlicesDirty(svc.Namespace, svc.Name)
+	c.registry.AddService(c.convertService(svc))
+	c.scheduleRebuildIfDirty(svc.Namespace, svc.Name)
 }
 
 func (c *Client) onServiceUpdate(oldObj, newObj any) {
@@ -317,22 +335,30 @@ func (c *Client) onServiceUpdate(oldObj, newObj any) {
 			zlog.String("type", fmt.Sprintf("%T", newObj)))
 		return
 	}
-	service := c.convertService(svc)
-	if err := c.registry.AddService(service); err != nil {
-		zlog.Error("Failed to update service in registry",
-			zlog.String("service", svc.Name),
-			zlog.String("namespace", svc.Namespace),
-			zlog.String("error", err.Error()))
+	c.bindServiceUID(svc)
+	c.markAllSlicesDirty(svc.Namespace, svc.Name)
+	c.registry.AddService(c.convertService(svc))
+	c.scheduleRebuildIfDirty(svc.Namespace, svc.Name)
+}
+
+func (c *Client) scheduleRebuildIfDirty(namespace, serviceName string) {
+	key := namespace + "/" + serviceName
+	c.slicesMu.Lock()
+	dirty := false
+	if entry := c.slicesByService[key]; entry != nil && len(entry.dirtySlices) > 0 {
+		dirty = true
+	}
+	c.slicesMu.Unlock()
+	if dirty {
+		c.scheduleRebuild(namespace, serviceName)
 	}
 }
 
 func (c *Client) onServiceDelete(obj any) {
 	svc, ok := obj.(*corev1.Service)
 	if !ok {
-		// DeleteFunc can deliver a tombstone when the final
-		// object was missed by the informer — unwrap it so the
-		// registry still sees the delete instead of keeping a
-		// stale DNS record.
+		// Unwrap informer tombstones so a missed-final-state
+		// delete still propagates.
 		if tombstone, tok := obj.(cache.DeletedFinalStateUnknown); tok {
 			svc, ok = tombstone.Obj.(*corev1.Service)
 		}
@@ -342,15 +368,100 @@ func (c *Client) onServiceDelete(obj any) {
 			return
 		}
 	}
-	if err := c.registry.DeleteService(svc.Name, svc.Namespace); err != nil {
-		zlog.Error("Failed to delete service from registry",
-			zlog.String("service", svc.Name),
-			zlog.String("namespace", svc.Namespace),
-			zlog.String("error", err.Error()))
+
+	// Set tombstone + clear slicesByService → flush queued rebuilds
+	// → DeleteService. Reversing this lets a worker rebuild write
+	// the registry AFTER DeleteService wiped it.
+	key := svc.Namespace + "/" + svc.Name
+	c.slicesMu.Lock()
+	delete(c.slicesByService, key)
+	if c.tombstones == nil {
+		c.tombstones = map[string]types.UID{}
+	}
+	if svc.UID != "" {
+		c.tombstones[key] = svc.UID
+	} else {
+		delete(c.tombstones, key)
+	}
+	c.slicesMu.Unlock()
+
+	c.flushRebuilds()
+	c.registry.DeleteService(svc.Name, svc.Namespace)
+}
+
+// bindServiceUID stamps svc.UID onto its slicesByService entry,
+// clearing any prior tombstone. Always materialises an entry so
+// the UID guard rejects late slice events from a previous
+// incarnation — without a placeholder, a delete-then-recreate
+// path would lose the guard and accept a stale slice. Slices
+// whose ownerRef disagrees with svc.UID are evicted.
+func (c *Client) bindServiceUID(svc *corev1.Service) {
+	if svc.UID == "" {
+		return
+	}
+	key := svc.Namespace + "/" + svc.Name
+	c.slicesMu.Lock()
+	delete(c.tombstones, key)
+
+	if c.slicesByService == nil {
+		c.slicesByService = map[string]*serviceSlices{}
+	}
+
+	dropped := false
+	entry := c.slicesByService[key]
+	switch {
+	case entry == nil:
+		c.slicesByService[key] = &serviceSlices{
+			svcUID:        svc.UID,
+			slices:        map[string][]Endpoint{},
+			sliceOwnerUID: map[string]types.UID{},
+		}
+	case entry.svcUID != "" && entry.svcUID != svc.UID:
+		c.slicesByService[key] = &serviceSlices{
+			svcUID:        svc.UID,
+			slices:        map[string][]Endpoint{},
+			sliceOwnerUID: map[string]types.UID{},
+		}
+		dropped = true
+	default:
+		entry.svcUID = svc.UID
+		for sliceName, ownerUID := range entry.sliceOwnerUID {
+			if ownerUID != "" && ownerUID != svc.UID {
+				delete(entry.slices, sliceName)
+				delete(entry.sliceOwnerUID, sliceName)
+				dropped = true
+			}
+		}
+	}
+	c.slicesMu.Unlock()
+
+	if dropped {
+		c.scheduleRebuild(svc.Namespace, svc.Name)
 	}
 }
 
-// Safe wrappers for EndpointSlice handlers
+// markAllSlicesDirty marks every tracked slice dirty so the next
+// worker drain re-pushes them through registry.ApplyEndpointSlice.
+// This is what replaces the synthetic-seed contribution (placed by
+// the AddService rebuild path) with real per-slice state in one
+// drain, instead of losing other slices on the first non-synthetic
+// Apply.
+func (c *Client) markAllSlicesDirty(namespace, serviceName string) {
+	key := namespace + "/" + serviceName
+	c.slicesMu.Lock()
+	defer c.slicesMu.Unlock()
+	entry := c.slicesByService[key]
+	if entry == nil || len(entry.slices) == 0 {
+		return
+	}
+	if entry.dirtySlices == nil {
+		entry.dirtySlices = map[string]struct{}{}
+	}
+	for sliceName := range entry.slices {
+		entry.dirtySlices[sliceName] = struct{}{}
+	}
+}
+
 func (c *Client) safeEndpointSliceAdd(obj any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -384,50 +495,273 @@ func (c *Client) safeEndpointSliceDelete(obj any) {
 	c.onEndpointSliceDelete(obj)
 }
 
-// EndpointSlice handlers. A Kubernetes service can back its
-// endpoints with many slices; every slice event must recompute
-// the union across all slices for that service, otherwise
-// slice-2's add would erase slice-1's endpoints and a delete
-// would wipe the whole service.
-
-// applyEndpointSlice updates the cached slice contents for a
-// service and writes the aggregated endpoint set to the registry.
-// Passing deleted=true removes the slice's contribution. The
-// aggregation uses slice.Name as identity so repeated
-// add/update events for the same slice replace — not append —
-// that slice's endpoints.
+// applyEndpointSlice records sliceName's contribution and schedules
+// a rebuild. Late events for a deleted Service (tombstone match) or
+// a Service whose UID disagrees with the slice's owner are dropped.
 func (c *Client) applyEndpointSlice(eps *discoveryv1.EndpointSlice, serviceName string, deleted bool) error {
 	key := eps.Namespace + "/" + serviceName
+	ownerUID := sliceOwnerUID(eps, serviceName)
 
 	c.slicesMu.Lock()
-	if c.slicesByService == nil {
-		c.slicesByService = make(map[string]map[string][]Endpoint)
+	if ownerUID != "" {
+		if tomb, ok := c.tombstones[key]; ok && tomb == ownerUID {
+			c.slicesMu.Unlock()
+			return nil
+		}
 	}
-	slices, ok := c.slicesByService[key]
+
+	if c.slicesByService == nil {
+		c.slicesByService = make(map[string]*serviceSlices)
+	}
+	entry, ok := c.slicesByService[key]
 	if !ok {
 		if deleted {
 			c.slicesMu.Unlock()
 			return nil
 		}
-		slices = make(map[string][]Endpoint)
-		c.slicesByService[key] = slices
+		entry = &serviceSlices{
+			slices:        map[string][]Endpoint{},
+			sliceOwnerUID: map[string]types.UID{},
+			dirtySlices:   map[string]struct{}{},
+		}
+		c.slicesByService[key] = entry
+	}
+	if entry.svcUID != "" && ownerUID != "" && ownerUID != entry.svcUID {
+		c.slicesMu.Unlock()
+		return nil
 	}
 	if deleted {
-		delete(slices, eps.Name)
+		if _, present := entry.slices[eps.Name]; !present {
+			c.slicesMu.Unlock()
+			return nil
+		}
+		delete(entry.slices, eps.Name)
+		delete(entry.sliceOwnerUID, eps.Name)
+		entry.markDirty(eps.Name)
 	} else {
-		slices[eps.Name] = c.convertEndpointSlice(eps)
+		converted := c.convertEndpointSlice(eps)
+		if existing, present := entry.slices[eps.Name]; present && endpointsEqual(existing, converted) {
+			if ownerUID != "" {
+				entry.sliceOwnerUID[eps.Name] = ownerUID
+			}
+			c.slicesMu.Unlock()
+			return nil
+		}
+		entry.slices[eps.Name] = converted
+		if ownerUID != "" {
+			entry.sliceOwnerUID[eps.Name] = ownerUID
+		} else {
+			delete(entry.sliceOwnerUID, eps.Name)
+		}
+		entry.markDirty(eps.Name)
+	}
+	// Entry deletion is deferred to rebuildService — dropping it
+	// here would lose the dirtySlices set.
+	c.slicesMu.Unlock()
+
+	c.scheduleRebuild(eps.Namespace, serviceName)
+	return nil
+}
+
+// endpointsEqual is the no-op guard for resourceVersion-only
+// EndpointSlice update events.
+func endpointsEqual(a, b []Endpoint) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].Hostname != b[i].Hostname || a[i].Ready != b[i].Ready {
+			return false
+		}
+		if len(a[i].Addresses) != len(b[i].Addresses) {
+			return false
+		}
+		for j := range a[i].Addresses {
+			if a[i].Addresses[j] != b[i].Addresses[j] {
+				return false
+			}
+		}
+		ar, br := a[i].TargetRef, b[i].TargetRef
+		if (ar == nil) != (br == nil) {
+			return false
+		}
+		if ar != nil && (ar.Kind != br.Kind || ar.Name != br.Name || ar.Namespace != br.Namespace) {
+			return false
+		}
+	}
+	return true
+}
+
+// sliceOwnerUID returns the Service UID from OwnerReferences, or
+// "" if absent (test fixtures, older objects).
+func sliceOwnerUID(eps *discoveryv1.EndpointSlice, serviceName string) types.UID {
+	for _, ref := range eps.OwnerReferences {
+		if ref.Kind == "Service" && ref.Name == serviceName {
+			return ref.UID
+		}
+	}
+	return ""
+}
+
+// scheduleRebuild routes through the worker queue when running,
+// else rebuilds inline (test path).
+func (c *Client) scheduleRebuild(namespace, serviceName string) {
+	if c.queue != nil && c.queue.running.Load() {
+		c.queue.enqueue(namespace + "/" + serviceName)
+		return
+	}
+	c.rebuildService(namespace, serviceName)
+}
+
+func (e *serviceSlices) markDirty(sliceName string) {
+	if e.dirtySlices == nil {
+		e.dirtySlices = map[string]struct{}{}
+	}
+	e.dirtySlices[sliceName] = struct{}{}
+}
+
+// rebuildService publishes recorded changes to the registry.
+// Headless services forward each dirty slice through the per-slice
+// API (O(slice size) instead of aggregation); non-headless services
+// keep the legacy aggregate-and-SetEndpoints path since their DNS
+// records come from svc.ClusterIPs, not endpoints.
+func (c *Client) rebuildService(namespace, serviceName string) {
+	defer c.rebuilds.Add(1)
+
+	key := namespace + "/" + serviceName
+	svc := c.registry.GetService(serviceName, namespace)
+	headless := svc != nil && svc.Headless
+
+	if !headless {
+		c.slicesMu.Lock()
+		var agg []Endpoint
+		if entry := c.slicesByService[key]; entry != nil && len(entry.slices) > 0 {
+			total := 0
+			for _, s := range entry.slices {
+				total += len(s)
+			}
+			agg = make([]Endpoint, 0, total)
+			for _, s := range entry.slices {
+				agg = append(agg, s...)
+			}
+			entry.dirtySlices = nil
+		}
+		c.slicesMu.Unlock()
+		c.registry.SetEndpoints(serviceName, namespace, agg)
+		return
 	}
 
-	var agg []Endpoint
-	for _, s := range slices {
-		agg = append(agg, s...)
+	// Snapshot dirty slices and forward individually. Slices missing
+	// from entry.slices were deleted (registry takes Remove). A nil
+	// dirtySlices set means no per-slice tracking yet — forward
+	// every current slice; the registry deduplicates via its
+	// own equality guard.
+	type sliceUpdate struct {
+		name    string
+		eps     []Endpoint
+		removed bool
 	}
-	if len(slices) == 0 {
-		delete(c.slicesByService, key)
+	var updates []sliceUpdate
+	c.slicesMu.Lock()
+	if entry := c.slicesByService[key]; entry != nil {
+		if entry.dirtySlices == nil {
+			for sliceName, eps := range entry.slices {
+				updates = append(updates, sliceUpdate{name: sliceName, eps: eps})
+			}
+		} else {
+			for sliceName := range entry.dirtySlices {
+				eps, present := entry.slices[sliceName]
+				updates = append(updates, sliceUpdate{
+					name:    sliceName,
+					eps:     eps,
+					removed: !present,
+				})
+			}
+		}
+		entry.dirtySlices = map[string]struct{}{}
+		if len(entry.slices) == 0 && entry.svcUID == "" {
+			delete(c.slicesByService, key)
+		}
 	}
 	c.slicesMu.Unlock()
 
-	return c.registry.SetEndpoints(serviceName, eps.Namespace, agg)
+	for _, u := range updates {
+		if u.removed {
+			c.registry.RemoveEndpointSlice(serviceName, namespace, u.name)
+		} else {
+			c.registry.ApplyEndpointSlice(serviceName, namespace, u.name, u.eps)
+		}
+	}
+	c.registry.MaterialiseHeadless(serviceName, namespace)
+}
+
+// Rebuilds returns the total number of per-service rebuilds.
+func (c *Client) Rebuilds() uint64 {
+	return c.rebuilds.Load()
+}
+
+// startRebuildWorker flips running synchronously before launching
+// the goroutine so the first informer callback never falls back to
+// the inline-rebuild path.
+func (c *Client) startRebuildWorker(ctx context.Context) <-chan struct{} {
+	if c.queue == nil {
+		c.queue = newRebuildQueue()
+	}
+	c.queue.running.Store(true)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer c.queue.running.Store(false)
+		c.runRebuildWorker(ctx)
+	}()
+	return done
+}
+
+func (c *Client) runRebuildWorker(ctx context.Context) {
+	debounce := c.rebuildDebounce
+	if debounce <= 0 {
+		debounce = rebuildDebounce
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.queue.notify:
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(debounce):
+		}
+
+		c.processPending()
+	}
+}
+
+// processPending holds processingMu for the entire drain so
+// flushRebuilds can wait for an in-flight cycle to finish.
+func (c *Client) processPending() {
+	c.queue.processingMu.Lock()
+	defer c.queue.processingMu.Unlock()
+	for _, key := range c.queue.drain() {
+		ns, name, ok := strings.Cut(key, "/")
+		if !ok {
+			continue
+		}
+		c.rebuildService(ns, name)
+	}
+}
+
+// flushRebuilds drains the queue and waits for any concurrent
+// worker dispatch to finish. Used after WaitForCacheSync so
+// synced=true reflects a fully-rebuilt registry.
+func (c *Client) flushRebuilds() {
+	if c.queue == nil {
+		return
+	}
+	c.processPending()
 }
 
 func (c *Client) onEndpointSliceAdd(obj any) {
@@ -437,7 +771,7 @@ func (c *Client) onEndpointSliceAdd(obj any) {
 			zlog.String("type", fmt.Sprintf("%T", obj)))
 		return
 	}
-	serviceName := eps.Labels["kubernetes.io/service-name"]
+	serviceName := eps.Labels[discoveryv1.LabelServiceName]
 	if serviceName == "" {
 		return
 	}
@@ -456,13 +790,30 @@ func (c *Client) onEndpointSliceUpdate(oldObj, newObj any) {
 			zlog.String("type", fmt.Sprintf("%T", newObj)))
 		return
 	}
-	serviceName := eps.Labels["kubernetes.io/service-name"]
-	if serviceName == "" {
+	newServiceName := eps.Labels[discoveryv1.LabelServiceName]
+
+	// On a service-name relabel (or label removal), retract the
+	// slice's contribution from the previous service so it doesn't
+	// keep stale endpoints.
+	if oldEps, ok := oldObj.(*discoveryv1.EndpointSlice); ok {
+		oldServiceName := oldEps.Labels[discoveryv1.LabelServiceName]
+		if oldServiceName != "" && oldServiceName != newServiceName {
+			if err := c.applyEndpointSlice(oldEps, oldServiceName, true); err != nil {
+				zlog.Error("Failed to retract endpoints after service-name relabel",
+					zlog.String("old_service", oldServiceName),
+					zlog.String("new_service", newServiceName),
+					zlog.String("namespace", oldEps.Namespace),
+					zlog.String("error", err.Error()))
+			}
+		}
+	}
+
+	if newServiceName == "" {
 		return
 	}
-	if err := c.applyEndpointSlice(eps, serviceName, false); err != nil {
+	if err := c.applyEndpointSlice(eps, newServiceName, false); err != nil {
 		zlog.Error("Failed to update endpoints in registry",
-			zlog.String("service", serviceName),
+			zlog.String("service", newServiceName),
 			zlog.String("namespace", eps.Namespace),
 			zlog.String("error", err.Error()))
 	}
@@ -480,7 +831,7 @@ func (c *Client) onEndpointSliceDelete(obj any) {
 			return
 		}
 	}
-	serviceName := eps.Labels["kubernetes.io/service-name"]
+	serviceName := eps.Labels[discoveryv1.LabelServiceName]
 	if serviceName == "" {
 		return
 	}
@@ -492,7 +843,6 @@ func (c *Client) onEndpointSliceDelete(obj any) {
 	}
 }
 
-// Safe wrappers for Pod handlers
 func (c *Client) safePodAdd(obj any) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -526,7 +876,6 @@ func (c *Client) safePodDelete(obj any) {
 	c.onPodDelete(obj)
 }
 
-// Pod handlers
 func (c *Client) onPodAdd(obj any) {
 	p, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -534,14 +883,8 @@ func (c *Client) onPodAdd(obj any) {
 			zlog.String("type", fmt.Sprintf("%T", obj)))
 		return
 	}
-	pod := c.convertPod(p)
-	if pod != nil {
-		if err := c.registry.AddPod(pod); err != nil {
-			zlog.Error("Failed to add pod to registry",
-				zlog.String("pod", p.Name),
-				zlog.String("namespace", p.Namespace),
-				zlog.String("error", err.Error()))
-		}
+	if pod := c.convertPod(p); pod != nil {
+		c.registry.AddPod(pod)
 	}
 }
 
@@ -553,26 +896,12 @@ func (c *Client) onPodUpdate(oldObj, newObj any) {
 		return
 	}
 
-	// Both registries index pods by IP. If the pod moved to a
-	// new address, AddPod on its own would write the new IP and
-	// leave the old IP still pointing at this pod, so reverse
-	// and pod-IP queries kept answering for the old IP. Remove
-	// the prior indexes before inserting the new state.
-	if err := c.registry.DeletePod(p.Name, p.Namespace); err != nil {
-		zlog.Debug("Failed to clear prior pod indexes on update",
-			zlog.String("pod", p.Name),
-			zlog.String("namespace", p.Namespace),
-			zlog.String("error", err.Error()))
-	}
+	// Pod IPs may have changed; DeletePod first so the old IP's
+	// index doesn't keep pointing at this pod.
+	c.registry.DeletePod(p.Name, p.Namespace)
 
-	pod := c.convertPod(p)
-	if pod != nil {
-		if err := c.registry.AddPod(pod); err != nil {
-			zlog.Error("Failed to update pod in registry",
-				zlog.String("pod", p.Name),
-				zlog.String("namespace", p.Namespace),
-				zlog.String("error", err.Error()))
-		}
+	if pod := c.convertPod(p); pod != nil {
+		c.registry.AddPod(pod)
 	}
 }
 
@@ -588,15 +917,8 @@ func (c *Client) onPodDelete(obj any) {
 			return
 		}
 	}
-	if err := c.registry.DeletePod(p.Name, p.Namespace); err != nil {
-		zlog.Error("Failed to delete pod from registry",
-			zlog.String("pod", p.Name),
-			zlog.String("namespace", p.Namespace),
-			zlog.String("error", err.Error()))
-	}
+	c.registry.DeletePod(p.Name, p.Namespace)
 }
-
-// Converters
 
 func (c *Client) convertService(svc *corev1.Service) *Service {
 	service := &Service{
@@ -605,12 +927,6 @@ func (c *Client) convertService(svc *corev1.Service) *Service {
 		Type:      string(svc.Spec.Type),
 	}
 
-	// Handle ClusterIPs. Read the plural field so dual-stack
-	// services contribute both IPv4 and IPv6 ClusterIPs; fall back
-	// to the singular field for older API objects. Previously this
-	// only read ClusterIP, hardcoded IPv4, and called ip.To4 — so
-	// IPv6-primary services stored nil and dual-stack secondary
-	// addresses were silently dropped.
 	if svc.Spec.ClusterIP == "None" {
 		service.Headless = true
 	} else {
@@ -638,12 +954,10 @@ func (c *Client) convertService(svc *corev1.Service) *Service {
 		}
 	}
 
-	// Handle ExternalName
 	if svc.Spec.Type == corev1.ServiceTypeExternalName {
 		service.ExternalName = svc.Spec.ExternalName
 	}
 
-	// Convert ports
 	for _, p := range svc.Spec.Ports {
 		service.Ports = append(service.Ports, Port{
 			Name:     p.Name,
@@ -663,10 +977,7 @@ func (c *Client) convertEndpointSlice(eps *discoveryv1.EndpointSlice) []Endpoint
 			continue
 		}
 
-		// discovery/v1 documents Ready==nil as "ready/true" —
-		// controllers and custom producers often omit the
-		// field. Treating nil as not-ready filtered those
-		// endpoints out of headless-service answers.
+		// discovery/v1 documents Ready==nil as ready=true.
 		endpoint := Endpoint{
 			Addresses: ep.Addresses,
 			Ready:     ep.Conditions.Ready == nil || *ep.Conditions.Ready,
@@ -695,7 +1006,6 @@ func (c *Client) convertPod(p *corev1.Pod) *Pod {
 		return nil
 	}
 
-	// Collect all pod IPs (supports dual-stack)
 	ips := []string{p.Status.PodIP}
 	for _, podIP := range p.Status.PodIPs {
 		if podIP.IP != "" && podIP.IP != p.Status.PodIP {
@@ -708,42 +1018,39 @@ func (c *Client) convertPod(p *corev1.Pod) *Pod {
 		Namespace: p.Namespace,
 		IPs:       ips,
 	}
-
 	if p.Spec.Hostname != "" {
 		pod.Hostname = p.Spec.Hostname
 	}
-
 	if p.Spec.Subdomain != "" {
 		pod.Subdomain = p.Spec.Subdomain
 	}
-
 	return pod
 }
 
-// buildConfig builds kubernetes config
+// buildConfig resolves the Kubernetes REST config. Precedence:
+// explicit kubeconfig path → in-cluster → KUBECONFIG env (multi-file)
+// / ~/.kube/config via clientcmd's default loading rules. An explicit
+// path must beat in-cluster so an operator-supplied kubeconfig isn't
+// silently overridden by a service-account mount.
 func buildConfig(kubeconfig string) (*rest.Config, error) {
-	// Try in-cluster config first
+	if kubeconfig != "" {
+		if _, err := os.Stat(kubeconfig); err != nil {
+			return nil, fmt.Errorf("kubeconfig %q: %w", kubeconfig, err)
+		}
+		return clientcmd.BuildConfigFromFlags("", kubeconfig)
+	}
+
 	if config, err := rest.InClusterConfig(); err == nil {
 		return config, nil
 	}
 
-	// Try kubeconfig file
-	if kubeconfig == "" {
-		if home := homedir.HomeDir(); home != "" {
-			kubeconfig = filepath.Join(home, ".kube", "config")
-		}
+	// clientcmd's default rules merge multi-path KUBECONFIG entries
+	// correctly; passing KUBECONFIG to BuildConfigFromFlags would
+	// treat the colon-separated list as one literal path.
+	loader := clientcmd.NewDefaultClientConfigLoadingRules()
+	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loader, &clientcmd.ConfigOverrides{}).ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("no kubernetes config found: %w", err)
 	}
-
-	if kubeconfig != "" {
-		if _, err := os.Stat(kubeconfig); err == nil {
-			return clientcmd.BuildConfigFromFlags("", kubeconfig)
-		}
-	}
-
-	// Try KUBECONFIG env
-	if kc := os.Getenv("KUBECONFIG"); kc != "" {
-		return clientcmd.BuildConfigFromFlags("", kc)
-	}
-
-	return nil, fmt.Errorf("no kubernetes config found")
+	return cfg, nil
 }

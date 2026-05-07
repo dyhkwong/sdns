@@ -175,7 +175,7 @@ func TestDualStackEndpoint(t *testing.T) {
 
 // TestIPv6ShardedRegistry tests IPv6 support in sharded registry
 func TestIPv6ShardedRegistry(t *testing.T) {
-	r := NewShardedRegistry()
+	r := NewRegistry()
 
 	// Add IPv6 service
 	r.AddService(&Service{
@@ -188,7 +188,7 @@ func TestIPv6ShardedRegistry(t *testing.T) {
 	})
 
 	// Query AAAA record
-	answers, found := r.ResolveQuery("ipv6-svc.default.svc.cluster.local.", dns.TypeAAAA)
+	answers, _, found := r.ResolveQuery("ipv6-svc.default.svc.cluster.local.", dns.TypeAAAA)
 	if !found {
 		t.Fatal("Service not found")
 	}
@@ -212,7 +212,7 @@ func TestIPv6ShardedRegistry(t *testing.T) {
 	})
 
 	// Query pod by IPv6
-	answers, found = r.ResolveQuery("2001-db8--100.default.pod.cluster.local.", dns.TypeAAAA)
+	answers, _, found = r.ResolveQuery("2001-db8--100.default.pod.cluster.local.", dns.TypeAAAA)
 	if !found {
 		t.Fatal("Pod not found")
 	}
@@ -221,7 +221,7 @@ func TestIPv6ShardedRegistry(t *testing.T) {
 	}
 
 	// Test IPv6 PTR
-	answers, found = r.ResolveQuery("0.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.", dns.TypePTR)
+	answers, _, found = r.ResolveQuery("0.0.1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.8.b.d.0.1.0.0.2.ip6.arpa.", dns.TypePTR)
 	if !found {
 		t.Fatal("PTR not found")
 	}

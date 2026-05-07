@@ -217,24 +217,19 @@ The Kubernetes middleware provides full DNS integration for Kubernetes clusters,
 - ExternalName services
 - Full IPv6 and dual-stack support
 - Real-time Kubernetes API synchronization
-- Optional "killer mode" for extreme performance
+- 256-way sharded registry for concurrent informer writes and lock-free reads
+- Reverse-IP and pod-by-name indexes for O(1) PTR / StatefulSet lookups
 
 **Configuration:**
 ```toml
 [kubernetes]
 enabled = true
 cluster_domain = "cluster.local"  # Default: cluster.local
-killer_mode = false               # Enable for maximum performance
 # kubeconfig = "/path/to/kubeconfig"  # Optional, uses in-cluster config by default
 ```
 
-**Killer Mode Features:**
-When `killer_mode` is enabled:
-- Zero-allocation wire-format caching
-- Lock-free ML-based query prediction
-- Sharded registry for concurrent operations
-- Predictive cache prefetching
-- 50,000+ QPS on single core
+> The legacy `killer_mode` flag is accepted for backward compatibility
+> but has no effect — the middleware always uses the sharded registry.
 
 For detailed information, see the [Kubernetes middleware documentation](middleware/kubernetes/README.md).
 
@@ -413,7 +408,7 @@ This is useful when:
 *   Automatic DNSSEC trust anchor updates (RFC 5011)
 *   Zero-allocation cache operations for improved performance
 *   TCP connection pooling for persistent connections
-*   **Kubernetes DNS integration with killer mode performance**
+*   **Kubernetes DNS integration with a 256-way sharded registry and zero-allocation lookups**
 *   **Automatic TLS certificate reloading without downtime**
 *   **DNS amplification/reflection attack detection (Reflex)**
 
@@ -471,11 +466,22 @@ SDNS demonstrates superior performance across all key metrics:
 - **Best reliability**: Only 1 lost query out of 50,000 (99.998% success rate)
 - **Fastest completion**: 70.5 seconds total runtime
 
-With Kubernetes killer mode enabled, SDNS can achieve:
-- **50,000+ QPS** on a single core for Kubernetes DNS queries
-- **Sub-100μs latency** for cached responses
-- **Zero allocations** in the hot path
-- **90%+ cache hit rates** with ML-based prediction
+For Kubernetes DNS, the registry is the hot path:
+
+- `BenchmarkRegistryResolveQuery` reports **0 B/op, 0 allocs/op** at
+  ~95 ns/op on Apple M5 — every query is a single sharded map lookup
+  followed by a slice-header copy.
+- Each mutation (`AddService`/`AddPod`/`SetEndpoints`) pre-builds the
+  `dns.RR` slices the affected names will return, including SRV
+  per named port and PTR for ClusterIPs / pod IPs.
+- The full `ServeDNS` path adds the unavoidable `dns.Msg` setup and
+  wire-pack overhead from miekg/dns; that's the only remaining
+  per-query allocation cost.
+
+> The legacy `killer_mode` flag is still parsed for backward
+> compatibility but is now a no-op — the registry above is always
+> active. The previous "killer mode" components (per-package cache,
+> SmartPredictor, PrefetchStrategy) were removed.
 
 ## Contributing
 

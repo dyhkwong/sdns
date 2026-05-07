@@ -40,10 +40,7 @@ func TestKubernetesDisabled(t *testing.T) {
 		t.Errorf("Expected cluster domain to be 'cluster.local', got %s", k.clusterDomain)
 	}
 
-	// Ensure resolver and registry are nil
-	if k.resolver != nil {
-		t.Error("Expected resolver to be nil when disabled")
-	}
+	// Ensure registry is nil
 	if k.registry != nil {
 		t.Error("Expected registry to be nil when disabled")
 	}
@@ -82,8 +79,8 @@ func TestKubernetesNilConfig(t *testing.T) {
 	k := New(cfg)
 
 	// Should be disabled by default
-	if k.resolver != nil {
-		t.Error("Expected resolver to be nil with default config")
+	if k.registry != nil {
+		t.Error("Expected registry to be nil with default config")
 	}
 
 	// Test ServeDNS

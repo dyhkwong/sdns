@@ -1,6 +1,7 @@
 *.pem
 *.crt
 *.key
+*.test
 sdns
 sdns.conf
 coverage.out
